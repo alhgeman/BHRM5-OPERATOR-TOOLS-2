@@ -1,0 +1,517 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+
+local plr = Players.LocalPlayer
+local cam = Workspace.CurrentCamera
+
+local state = {
+    fullBright = false,
+    wallEsp = false,
+    hitbox = false,
+    npcEsp = false,
+    guiVis = true,
+    unloaded = false,
+}
+
+local npcMap = {}
+local boxMap = {}
+local origSizes = {}
+local origTrans = {}
+local fbConn = nil
+local renderConn = nil
+
+local function countNPCs()
+    local c = 0
+    for _ in pairs(npcMap) do c = c + 1 end
+    return c
+end
+
+local function getNpcHead(model)
+    return model:FindFirstChild("FakeHead")
+end
+
+local function getNpcRoot(model)
+    return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Root")
+end
+
+local function isNPC(model)
+    if not model or not model:IsA("Model") then return false end
+    if plr.Character and (model == plr.Character or model:IsDescendantOf(plr.Character)) then
+        return false
+    end
+    if model.Name ~= "Male" then return false end
+    local parent = model.Parent
+    if not parent or parent.Name ~= "Model" then return false end
+    local head = model:FindFirstChild("FakeHead")
+    local root = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Root")
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then
+        return false
+    end
+    return head and root ~= nil
+end
+
+local removeNPC
+local addNPC
+
+local function findAllNPCs()
+    local npcs = {}
+    local function search(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if isNPC(child) then
+                table.insert(npcs, child)
+            end
+            search(child)
+        end
+    end
+    search(Workspace)
+    return npcs
+end
+
+local function scanNPCs()
+    local npcs = findAllNPCs()
+    for _, npc in ipairs(npcs) do
+        addNPC(npc)
+    end
+end
+
+local function makeBox(part)
+    if not part or not part.Parent then return nil end
+    if part:FindFirstChild("WallBox") then return part.WallBox end
+    local box = Instance.new("BoxHandleAdornment")
+    box.Name = "WallBox"
+    box.Size = part.Size + Vector3.new(0.5, 0.5, 0.5)
+    box.Adornee = part
+    box.AlwaysOnTop = true
+    box.ZIndex = 10
+    box.Color3 = Color3.fromRGB(255, 0, 0)
+    box.Transparency = 0.3
+    box.Parent = part
+    return box
+end
+
+local function killBox(part)
+    if not part then return end
+    local box = part:FindFirstChild("WallBox")
+    if box then box:Destroy() end
+end
+
+local function killAllBoxes()
+    for head, box in pairs(boxMap) do
+        if box and box.Parent then box:Destroy() end
+    end
+    boxMap = {}
+end
+
+local function refreshBoxes()
+    killAllBoxes()
+    if not state.wallEsp then return end
+    for model in pairs(npcMap) do
+        local head = getNpcHead(model)
+        if head then
+            local box = makeBox(head)
+            if box then boxMap[head] = box end
+        end
+    end
+end
+
+local function applyHitboxAndESP()
+    for model in pairs(npcMap) do
+        local root = getNpcRoot(model)
+        if root then
+            if not origSizes[model] then origSizes[model] = root.Size end
+            if origTrans[model] == nil then origTrans[model] = root.Transparency end
+            if state.hitbox then
+                root.Size = Vector3.new(20, 20, 20)
+                root.CanCollide = false
+                root.Transparency = state.npcEsp and 0.8 or origTrans[model]
+            else
+                if origSizes[model] then root.Size = origSizes[model] end
+                root.Transparency = state.npcEsp and 0.8 or origTrans[model]
+            end
+        end
+    end
+end
+
+local function resetAllSizes()
+    for model in pairs(npcMap) do
+        local root = getNpcRoot(model)
+        if root then
+            if origSizes[model] then root.Size = origSizes[model] end
+            root.Transparency = origTrans[model] or 0
+        end
+    end
+    origSizes = {}
+    origTrans = {}
+end
+
+local origLight = {
+    Ambient = Lighting.Ambient,
+    Brightness = Lighting.Brightness,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+    FogEnd = Lighting.FogEnd,
+    FogStart = Lighting.FogStart,
+    GlobalShadows = Lighting.GlobalShadows,
+}
+
+local function applyFB()
+    if state.unloaded then return end
+    Lighting.Ambient = Color3.new(1, 1, 1)
+    Lighting.Brightness = 10
+    Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+    Lighting.FogEnd = 100000
+    Lighting.FogStart = 0
+    Lighting.GlobalShadows = false
+end
+
+local function restoreFB()
+    for k, v in pairs(origLight) do
+        Lighting[k] = v
+    end
+end
+
+local status
+
+local lastCamPos = cam.CFrame.Position
+local raycastCooldown = 0
+
+local function onRender(dt)
+    if state.unloaded then return end
+    for model in pairs(npcMap) do
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if not model.Parent or (hum and hum.Health <= 0) then
+            removeNPC(model)
+            if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
+        end
+    end
+    raycastCooldown = raycastCooldown - dt
+    local camPos = cam.CFrame.Position
+    if state.wallEsp and (raycastCooldown <= 0 or (camPos - lastCamPos).Magnitude > 1) then
+        raycastCooldown = 0.1
+        lastCamPos = camPos
+        local origin = cam.CFrame.Position
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Blacklist
+        params.FilterDescendantsInstances = {plr.Character}
+        for head, box in pairs(boxMap) do
+            if head and head.Parent and box and box.Parent then
+                params.FilterDescendantsInstances[2] = head
+                local result = Workspace:Raycast(origin, head.Position - origin, params)
+                local visible = not result or result.Instance:IsDescendantOf(head.Parent)
+                box.Color3 = visible and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
+            else
+                boxMap[head] = nil
+            end
+        end
+    end
+    if state.hitbox or state.npcEsp then
+        applyHitboxAndESP()
+    end
+end
+
+addNPC = function(model)
+    if not model or not model.Parent then return end
+    if npcMap[model] then return end
+    if not isNPC(model) then return end
+    npcMap[model] = true
+    local root = getNpcRoot(model)
+    if root then
+        if not origSizes[model] then origSizes[model] = root.Size end
+        if origTrans[model] == nil then origTrans[model] = root.Transparency end
+        if state.hitbox then
+            root.Size = Vector3.new(12, 12, 12)
+            root.CanCollide = false
+            root.Transparency = state.npcEsp and 0.8 or origTrans[model]
+        elseif state.npcEsp then
+            root.Transparency = 0.8
+        end
+    end
+    if state.wallEsp then
+        local head = getNpcHead(model)
+        if head then
+            local box = makeBox(head)
+            if box then boxMap[head] = box end
+        end
+    end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum.HealthChanged:Connect(function(health)
+            if health <= 0 then
+                removeNPC(model)
+                if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
+            end
+        end)
+    end
+end
+
+removeNPC = function(model)
+    if not model then return end
+    npcMap[model] = nil
+    local head = getNpcHead(model)
+    if head then killBox(head) end
+    local root = getNpcRoot(model)
+    if root then
+        if origSizes[model] and root.Parent then
+            pcall(function()
+                root.Size = origSizes[model]
+                root.CanCollide = true
+                root.Transparency = origTrans[model] or 0
+            end)
+        end
+    end
+    origSizes[model] = nil
+    origTrans[model] = nil
+end
+
+local sg = Instance.new("ScreenGui", plr:WaitForChild("PlayerGui"))
+sg.Name = "BHRM5_GUI"
+sg.ResetOnSpawn = false
+
+local frame = Instance.new("Frame", sg)
+frame.Position = UDim2.new(0, 20, 0, 20)
+frame.Size = UDim2.new(0, 260, 0, 340)
+frame.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
+frame.BackgroundTransparency = 0.15
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = true
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 16)
+
+local shadow = Instance.new("Frame", sg)
+shadow.Position = frame.Position + UDim2.new(0, 8, 0, 8)
+shadow.Size = frame.Size
+shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+shadow.BackgroundTransparency = 0.7
+shadow.BorderSizePixel = 0
+shadow.ZIndex = 0
+Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, 16)
+
+local neonBar = Instance.new("Frame", frame)
+neonBar.Size = UDim2.new(0.7, 0, 0, 3)
+neonBar.Position = UDim2.new(0.15, 0, 0, 0)
+neonBar.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
+neonBar.BorderSizePixel = 0
+Instance.new("UICorner", neonBar).CornerRadius = UDim.new(1, 0)
+local glowTween = TweenService:Create(neonBar, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+    BackgroundTransparency = 0.2
+})
+glowTween:Play()
+
+local title = Instance.new("TextLabel", frame)
+title.Text = "BHRM5 OPERATOR TOOLS 2"
+title.Size = UDim2.new(1, -20, 0, 48)
+title.Position = UDim2.new(0, 10, 0, 6)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(220, 235, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextYAlignment = Enum.TextYAlignment.Center
+
+local sub = Instance.new("TextLabel", frame)
+sub.Text = "by Ben = Katro"
+sub.Size = UDim2.new(1, -20, 0, 18)
+sub.Position = UDim2.new(0, 10, 0, 50)
+sub.BackgroundTransparency = 1
+sub.TextColor3 = Color3.fromRGB(140, 140, 180)
+sub.Font = Enum.Font.Gotham
+sub.TextSize = 11
+sub.TextXAlignment = Enum.TextXAlignment.Left
+sub.TextYAlignment = Enum.TextYAlignment.Top
+
+status = Instance.new("TextLabel", frame)
+status.Text = "◆ " .. countNPCs() .. " NPCs geladen"
+status.Size = UDim2.new(1, -20, 0, 16)
+status.Position = UDim2.new(0, 10, 0, 70)
+status.BackgroundTransparency = 1
+status.TextColor3 = Color3.fromRGB(100, 200, 100)
+status.Font = Enum.Font.Gotham
+status.TextSize = 11
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+
+local cont = Instance.new("Frame", frame)
+cont.Position = UDim2.new(0, 10, 0, 90)
+cont.Size = UDim2.new(1, -20, 1, -110)
+cont.BackgroundTransparency = 1
+
+local list = Instance.new("UIListLayout", cont)
+list.Padding = UDim.new(0, 7)
+list.FillDirection = Enum.FillDirection.Vertical
+list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+list.VerticalAlignment = Enum.VerticalAlignment.Top
+
+local function makeBtn(text, color, icon)
+    local b = Instance.new("TextButton", cont)
+    b.Size = UDim2.new(1, 0, 0, 34)
+    b.Text = (icon and icon .. " " or "") .. text
+    b.BackgroundColor3 = color
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = false
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    local function onHover()
+        TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.2)}):Play()
+    end
+    local function onLeave()
+        TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = color}):Play()
+    end
+    b.MouseEnter:Connect(onHover)
+    b.MouseLeave:Connect(onLeave)
+    return b
+end
+
+local fbBtn = makeBtn("FullBright", Color3.fromRGB(20, 40, 80), "☀")
+fbBtn.MouseButton1Click:Connect(function()
+    state.fullBright = not state.fullBright
+    if state.fullBright then
+        if fbConn then fbConn:Disconnect() end
+        fbConn = RunService.RenderStepped:Connect(applyFB)
+        applyFB()
+        fbBtn.Text = "☀ FullBright ON"
+        fbBtn.BackgroundColor3 = Color3.fromRGB(20, 80, 40)
+    else
+        if fbConn then fbConn:Disconnect() fbConn = nil end
+        restoreFB()
+        fbBtn.Text = "☀ FullBright"
+        fbBtn.BackgroundColor3 = Color3.fromRGB(20, 40, 80)
+    end
+end)
+
+local wallBtn = makeBtn("Wall ESP", Color3.fromRGB(30, 30, 55), "⬜")
+wallBtn.MouseButton1Click:Connect(function()
+    state.wallEsp = not state.wallEsp
+    if state.wallEsp then
+        wallBtn.Text = "⬜ Wall ESP ON"
+        wallBtn.BackgroundColor3 = Color3.fromRGB(30, 70, 40)
+        refreshBoxes()
+    else
+        wallBtn.Text = "⬜ Wall ESP"
+        wallBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 55)
+        killAllBoxes()
+    end
+end)
+
+local hbBtn = makeBtn("Hitbox", Color3.fromRGB(60, 20, 25), "⬡")
+hbBtn.MouseButton1Click:Connect(function()
+    state.hitbox = not state.hitbox
+    if state.hitbox then
+        hbBtn.Text = "⬡ Hitbox ON"
+        hbBtn.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
+        applyHitboxAndESP()
+    else
+        hbBtn.Text = "⬡ Hitbox"
+        hbBtn.BackgroundColor3 = Color3.fromRGB(60, 20, 25)
+        applyHitboxAndESP()
+    end
+end)
+
+local espBtn = makeBtn("NPC ESP", Color3.fromRGB(20, 55, 65), "👤")
+espBtn.MouseButton1Click:Connect(function()
+    state.npcEsp = not state.npcEsp
+    if state.npcEsp then
+        espBtn.Text = "👤 NPC ESP ON"
+        espBtn.BackgroundColor3 = Color3.fromRGB(20, 75, 65)
+        applyHitboxAndESP()
+    else
+        espBtn.Text = "👤 NPC ESP"
+        espBtn.BackgroundColor3 = Color3.fromRGB(20, 55, 65)
+        applyHitboxAndESP()
+    end
+end)
+
+local ulBtn = makeBtn("UNLOAD", Color3.fromRGB(80, 10, 15), "✕")
+ulBtn.TextColor3 = Color3.fromRGB(255, 160, 160)
+ulBtn.MouseButton1Click:Connect(function()
+    state.unloaded = true
+    killAllBoxes()
+    resetAllSizes()
+    if fbConn then fbConn:Disconnect() fbConn = nil end
+    if renderConn then renderConn:Disconnect() renderConn = nil end
+    restoreFB()
+    sg:Destroy()
+end)
+
+local drag, dragInput, dragStart, startPos
+frame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        drag = true
+        dragStart = input.Position
+        startPos = frame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then drag = false end
+        end)
+    end
+end)
+frame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then dragInput = input end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and drag then
+        local delta = input.Position - dragStart
+        frame.Position = startPos + UDim2.new(0, delta.X, 0, delta.Y)
+        shadow.Position = frame.Position + UDim2.new(0, 8, 0, 8)
+    end
+end)
+
+local showBtn
+local function makeShowBtn()
+    if showBtn then showBtn:Destroy() end
+    showBtn = Instance.new("ImageButton", sg)
+    showBtn.Size = UDim2.new(0, 50, 0, 50)
+    showBtn.Position = UDim2.new(0, 20, 1, -68)
+    showBtn.BackgroundColor3 = Color3.fromRGB(15, 15, 28)
+    showBtn.BackgroundTransparency = 0.3
+    showBtn.Image = "rbxassetid://7733714924"
+    showBtn.ImageColor3 = Color3.fromRGB(0, 200, 255)
+    showBtn.ImageTransparency = 0.15
+    showBtn.Visible = false
+    Instance.new("UICorner", showBtn).CornerRadius = UDim.new(1, 0)
+    showBtn.MouseButton1Click:Connect(function()
+        state.guiVis = true
+        frame.Visible = true
+        shadow.Visible = true
+        showBtn.Visible = false
+    end)
+end
+makeShowBtn()
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or state.unloaded then return end
+    if input.KeyCode == Enum.KeyCode.Insert then
+        state.guiVis = not state.guiVis
+        frame.Visible = state.guiVis
+        shadow.Visible = state.guiVis
+        showBtn.Visible = not state.guiVis
+    end
+end)
+
+scanNPCs()
+status.Text = "◆ " .. countNPCs() .. " NPCs geladen"
+renderConn = RunService.RenderStepped:Connect(onRender)
+
+Workspace.DescendantAdded:Connect(function(descendant)
+    if state.unloaded then return end
+    if descendant:IsA("Model") and descendant.Name == "Male" then
+        task.wait(0.2)
+        if isNPC(descendant) then
+            addNPC(descendant)
+            if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
+        end
+    end
+end)
+
+task.spawn(function()
+    while not state.unloaded do
+        scanNPCs()
+        if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
+        task.wait(10)
+    end
+end)
+
+print("BHRM5 OPERATOR TOOLS 2 geladen · Insert zum Ein-/Ausblenden")
