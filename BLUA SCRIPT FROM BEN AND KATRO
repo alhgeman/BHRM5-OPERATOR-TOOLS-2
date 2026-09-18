@@ -1,517 +1,845 @@
+-- BHRM5 OPERATOR TOOL 2 // compact: fullbright + wall esp + head silent aim + wallbang attempt
+-- Removed per He: hitbox, npc esp (ghost), rapid fire, triggerbot, recoil, thermal, tps, fly, kill aura.
+-- Labels fixed: "Wall ESP" = boxes on npcs through walls. No second ESP toggle.
+-- Compact UI: single column, small cards, scroll if overflow.
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
-local TweenService = game:GetService("TweenService")
 
 local plr = Players.LocalPlayer
 local cam = Workspace.CurrentCamera
+local playerGui = plr:WaitForChild("PlayerGui")
 
 local state = {
     fullBright = false,
     wallEsp = false,
-    hitbox = false,
-    npcEsp = false,
+    silentAim = false,
+    wallbang = false,
     guiVis = true,
     unloaded = false,
+    fovRadius = 160,
+    showFov = true,
+    aimPart = "Head",
 }
 
 local npcMap = {}
 local boxMap = {}
-local origSizes = {}
-local origTrans = {}
-local fbConn = nil
-local renderConn = nil
 
+local fbConn, renderConn, addConn, inputConn = nil, nil, nil, nil
+local conns = {}
+local function track(c) table.insert(conns, c) return c end
+
+local hookSilentAim, unhookSilentAim = nil, nil
+local fovCircle = nil
+local cachedTarget = nil
+
+-- ============ NPC ============
+local function getNpcHead(m) return m:FindFirstChild("Head") or m:FindFirstChild("FakeHead") end
+local function getNpcRoot(m) return m:FindFirstChild("Root") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("LowerTorso") end
+local function isNPC(model)
+    if state.unloaded then return false end
+    if not model or not model:IsA("Model") then return false end
+    if model.Name ~= "Male" then return false end
+    local char = plr.Character
+    if char then
+        if model == char then return false end
+        local ok, isDesc = pcall(function() return model:IsDescendantOf(char) end)
+        if ok and isDesc then return false end
+    end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return false end
+    local head, root = getNpcHead(model), getNpcRoot(model)
+    if not head or not root then return false end
+    if not head:IsA("BasePart") or not root:IsA("BasePart") then return false end
+    return true
+end
 local function countNPCs()
     local c = 0
-    for _ in pairs(npcMap) do c = c + 1 end
+    for _ in pairs(npcMap) do c += 1 end
     return c
 end
 
-local function getNpcHead(model)
-    return model:FindFirstChild("FakeHead")
-end
-
-local function getNpcRoot(model)
-    return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Root")
-end
-
-local function isNPC(model)
-    if not model or not model:IsA("Model") then return false end
-    if plr.Character and (model == plr.Character or model:IsDescendantOf(plr.Character)) then
-        return false
-    end
-    if model.Name ~= "Male" then return false end
-    local parent = model.Parent
-    if not parent or parent.Name ~= "Model" then return false end
-    local head = model:FindFirstChild("FakeHead")
-    local root = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Root")
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum and hum.Health <= 0 then
-        return false
-    end
-    return head and root ~= nil
-end
-
-local removeNPC
-local addNPC
-
-local function findAllNPCs()
-    local npcs = {}
-    local function search(parent)
-        for _, child in ipairs(parent:GetChildren()) do
-            if isNPC(child) then
-                table.insert(npcs, child)
-            end
-            search(child)
-        end
-    end
-    search(Workspace)
-    return npcs
-end
-
-local function scanNPCs()
-    local npcs = findAllNPCs()
-    for _, npc in ipairs(npcs) do
-        addNPC(npc)
-    end
-end
-
+-- ============ WALL ESP (boxes on npc heads, green = visible / red = behind wall) ============
 local function makeBox(part)
     if not part or not part.Parent then return nil end
-    if part:FindFirstChild("WallBox") then return part.WallBox end
+    local old = part:FindFirstChild("WallBox")
+    if old then return old end
     local box = Instance.new("BoxHandleAdornment")
     box.Name = "WallBox"
-    box.Size = part.Size + Vector3.new(0.5, 0.5, 0.5)
+    box.Size = part.Size + Vector3.new(0.6, 0.6, 0.6)
     box.Adornee = part
     box.AlwaysOnTop = true
     box.ZIndex = 10
-    box.Color3 = Color3.fromRGB(255, 0, 0)
-    box.Transparency = 0.3
+    box.Color3 = Color3.fromRGB(255, 60, 60)
+    box.Transparency = 0.35
     box.Parent = part
     return box
 end
-
-local function killBox(part)
-    if not part then return end
-    local box = part:FindFirstChild("WallBox")
-    if box then box:Destroy() end
-end
-
 local function killAllBoxes()
-    for head, box in pairs(boxMap) do
-        if box and box.Parent then box:Destroy() end
+    for adorned, box in pairs(boxMap) do
+        pcall(function() if box and box.Parent then box:Destroy() end end)
+        if adorned and adorned.Parent then
+            pcall(function()
+                local b = adorned:FindFirstChild("WallBox")
+                if b then b:Destroy() end
+            end)
+        end
     end
-    boxMap = {}
+    table.clear(boxMap)
+    for model in pairs(npcMap) do
+        pcall(function()
+            for _, d in ipairs(model:GetDescendants()) do
+                if d.Name == "WallBox" and d:IsA("BoxHandleAdornment") then d:Destroy() end
+            end
+        end)
+    end
 end
-
 local function refreshBoxes()
     killAllBoxes()
     if not state.wallEsp then return end
     for model in pairs(npcMap) do
-        local head = getNpcHead(model)
-        if head then
-            local box = makeBox(head)
-            if box then boxMap[head] = box end
+        local d = npcMap[model]
+        if d and d.head and d.head.Parent then
+            local box = makeBox(d.head)
+            if box then boxMap[d.head] = box end
         end
     end
 end
 
-local function applyHitboxAndESP()
-    for model in pairs(npcMap) do
-        local root = getNpcRoot(model)
-        if root then
-            if not origSizes[model] then origSizes[model] = root.Size end
-            if origTrans[model] == nil then origTrans[model] = root.Transparency end
-            if state.hitbox then
-                root.Size = Vector3.new(20, 20, 20)
-                root.CanCollide = false
-                root.Transparency = state.npcEsp and 0.8 or origTrans[model]
-            else
-                if origSizes[model] then root.Size = origSizes[model] end
-                root.Transparency = state.npcEsp and 0.8 or origTrans[model]
-            end
-        end
-    end
-end
-
-local function resetAllSizes()
-    for model in pairs(npcMap) do
-        local root = getNpcRoot(model)
-        if root then
-            if origSizes[model] then root.Size = origSizes[model] end
-            root.Transparency = origTrans[model] or 0
-        end
-    end
-    origSizes = {}
-    origTrans = {}
-end
-
+-- ============ FULLBRIGHT ============
 local origLight = {
-    Ambient = Lighting.Ambient,
-    Brightness = Lighting.Brightness,
-    OutdoorAmbient = Lighting.OutdoorAmbient,
-    FogEnd = Lighting.FogEnd,
-    FogStart = Lighting.FogStart,
-    GlobalShadows = Lighting.GlobalShadows,
+    Ambient = Lighting.Ambient, Brightness = Lighting.Brightness,
+    OutdoorAmbient = Lighting.OutdoorAmbient, FogEnd = Lighting.FogEnd,
+    FogStart = Lighting.FogStart, GlobalShadows = Lighting.GlobalShadows,
+    ClockTime = Lighting.ClockTime,
 }
-
 local function applyFB()
     if state.unloaded then return end
     Lighting.Ambient = Color3.new(1, 1, 1)
-    Lighting.Brightness = 10
+    Lighting.Brightness = 3
     Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
     Lighting.FogEnd = 100000
     Lighting.FogStart = 0
     Lighting.GlobalShadows = false
+    Lighting.ClockTime = 14
 end
-
 local function restoreFB()
-    for k, v in pairs(origLight) do
-        Lighting[k] = v
-    end
+    for k, v in pairs(origLight) do pcall(function() Lighting[k] = v end) end
 end
 
-local status
-
-local lastCamPos = cam.CFrame.Position
-local raycastCooldown = 0
-
-local function onRender(dt)
-    if state.unloaded then return end
-    for model in pairs(npcMap) do
-        local hum = model:FindFirstChildOfClass("Humanoid")
-        if not model.Parent or (hum and hum.Health <= 0) then
-            removeNPC(model)
-            if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
-        end
-    end
-    raycastCooldown = raycastCooldown - dt
-    local camPos = cam.CFrame.Position
-    if state.wallEsp and (raycastCooldown <= 0 or (camPos - lastCamPos).Magnitude > 1) then
-        raycastCooldown = 0.1
-        lastCamPos = camPos
-        local origin = cam.CFrame.Position
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Blacklist
-        params.FilterDescendantsInstances = {plr.Character}
-        for head, box in pairs(boxMap) do
-            if head and head.Parent and box and box.Parent then
-                params.FilterDescendantsInstances[2] = head
-                local result = Workspace:Raycast(origin, head.Position - origin, params)
-                local visible = not result or result.Instance:IsDescendantOf(head.Parent)
-                box.Color3 = visible and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
-            else
-                boxMap[head] = nil
-            end
-        end
-    end
-    if state.hitbox or state.npcEsp then
-        applyHitboxAndESP()
-    end
-end
-
-addNPC = function(model)
+-- ============ ADD / REMOVE ============
+local removeNPC, addNPC, tryAddLater
+tryAddLater = function(model, tries)
+    if state.unloaded or npcMap[model] then return end
     if not model or not model.Parent then return end
-    if npcMap[model] then return end
-    if not isNPC(model) then return end
-    npcMap[model] = true
-    local root = getNpcRoot(model)
-    if root then
-        if not origSizes[model] then origSizes[model] = root.Size end
-        if origTrans[model] == nil then origTrans[model] = root.Transparency end
-        if state.hitbox then
-            root.Size = Vector3.new(12, 12, 12)
-            root.CanCollide = false
-            root.Transparency = state.npcEsp and 0.8 or origTrans[model]
-        elseif state.npcEsp then
-            root.Transparency = 0.8
-        end
-    end
-    if state.wallEsp then
-        local head = getNpcHead(model)
-        if head then
-            local box = makeBox(head)
-            if box then boxMap[head] = box end
-        end
-    end
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum then
-        hum.HealthChanged:Connect(function(health)
-            if health <= 0 then
-                removeNPC(model)
-                if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
-            end
-        end)
-    end
+    tries = tries or 0
+    if tries > 6 then return end
+    local ok, res = pcall(isNPC, model)
+    if ok and res then addNPC(model)
+    elseif model.Parent then task.delay(0.5, function() tryAddLater(model, tries + 1) end) end
 end
-
+addNPC = function(model)
+    if state.unloaded or npcMap[model] or not model.Parent then return end
+    if not isNPC(model) then return end
+    local root, head = getNpcRoot(model), getNpcHead(model)
+    if not root or not head then return end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local data = { root = root, head = head, hum = hum, conn = nil, ancestryConn = nil }
+    npcMap[model] = data
+    if state.wallEsp then
+        local box = makeBox(head)
+        if box then boxMap[head] = box end
+    end
+    if hum then
+        data.conn = track(hum.Died:Connect(function() removeNPC(model) end))
+    end
+    local c
+    c = track(model.AncestryChanged:Connect(function(_, parent)
+        if parent == nil then
+            if c then pcall(function() c:Disconnect() end) end
+            removeNPC(model)
+        end
+    end))
+    data.ancestryConn = c
+end
 removeNPC = function(model)
     if not model then return end
+    local d = npcMap[model]
     npcMap[model] = nil
-    local head = getNpcHead(model)
-    if head then killBox(head) end
-    local root = getNpcRoot(model)
-    if root then
-        if origSizes[model] and root.Parent then
+    if d then
+        if d.head then
             pcall(function()
-                root.Size = origSizes[model]
-                root.CanCollide = true
-                root.Transparency = origTrans[model] or 0
+                local b = d.head:FindFirstChild("WallBox")
+                if b then b:Destroy() end
+            end)
+            boxMap[d.head] = nil
+        end
+        if d.conn then pcall(function() d.conn:Disconnect() end) end
+        if d.ancestryConn then pcall(function() d.ancestryConn:Disconnect() end) end
+        if cachedTarget and (cachedTarget == d.head or cachedTarget == d.root) then cachedTarget = nil end
+    end
+end
+local function scanNPCs()
+    if state.unloaded then return end
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Model") and desc.Name == "Male" and not npcMap[desc] then
+            local ok, res = pcall(isNPC, desc)
+            if ok and res then pcall(addNPC, desc) end
+        end
+    end
+end
+
+-- ================================================================
+--  COMPACT GUI — BHRM5 OPERATOR TOOL 2
+-- ================================================================
+for _, n in ipairs({ "BHRM5_GUI", "BHRM5_V2", "BHRM5_V3", "BHRM5_V4" }) do
+    local o = playerGui:FindFirstChild(n)
+    if o then o:Destroy() end
+end
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "BHRM5_V2"
+sg.ResetOnSpawn = false
+sg.DisplayOrder = 999
+sg.IgnoreGuiInset = true
+sg.Parent = playerGui
+
+local ACCENT = Color3.fromRGB(0, 210, 255)
+local ACCENT2 = Color3.fromRGB(150, 80, 255)
+local BG = Color3.fromRGB(7, 10, 19)
+local CARD = Color3.fromRGB(13, 18, 32)
+local CARD_HI = Color3.fromRGB(20, 27, 46)
+local TXT = Color3.fromRGB(225, 238, 255)
+local DIM = Color3.fromRGB(130, 145, 175)
+local TS = game:GetService("TweenService")
+
+-- ambient glow behind panel (centered, smaller than before, can't peek out)
+local aura = Instance.new("ImageLabel")
+aura.AnchorPoint = Vector2.new(0.5, 0.5)
+aura.Position = UDim2.new(0, 152, 0, 226)
+aura.Size = UDim2.new(0, 300, 0, 410)
+aura.BackgroundTransparency = 1
+aura.Image = "rbxassetid://5028857084"
+aura.ImageColor3 = ACCENT
+aura.ImageTransparency = 0.88
+aura.ZIndex = 0
+aura.Parent = sg
+task.spawn(function()
+    while not state.unloaded and aura.Parent do
+        local t = TS:Create(aura, TweenInfo.new(3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 0, true), { ImageTransparency = 0.78 })
+        t:Play() t.Completed:Wait()
+        if state.unloaded then break end
+        task.wait(0.3)
+    end
+end)
+
+local frame = Instance.new("Frame")
+frame.Position = UDim2.new(0, 20, 0, 20)
+frame.Size = UDim2.new(0, 264, 0, 372)
+frame.BackgroundColor3 = BG
+frame.BackgroundTransparency = 0.02
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = true
+frame.Active = true
+frame.Parent = sg
+local fC = Instance.new("UICorner") fC.CornerRadius = UDim.new(0, 16) fC.Parent = frame
+local stroke = Instance.new("UIStroke")
+stroke.Color = ACCENT; stroke.Thickness = 1.2; stroke.Transparency = 0.4; stroke.Parent = frame
+task.spawn(function()
+    while not state.unloaded and stroke.Parent do
+        local t = TS:Create(stroke, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 0, true), { Transparency = 0.12 })
+        t:Play() t.Completed:Wait()
+        if state.unloaded then break end
+        task.wait(0.2)
+    end
+end)
+
+-- animated top gradient bar
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 3)
+topBar.BackgroundColor3 = Color3.new(1, 1, 1)
+topBar.BorderSizePixel = 0
+topBar.Parent = frame
+local grad = Instance.new("UIGradient")
+grad.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0, ACCENT),
+    ColorSequenceKeypoint.new(0.5, ACCENT2),
+    ColorSequenceKeypoint.new(1, ACCENT),
+}
+grad.Parent = topBar
+task.spawn(function()
+    while not state.unloaded and grad.Parent do
+        local ok = pcall(function()
+            local t = TS:Create(grad, TweenInfo.new(2.5, Enum.EasingStyle.Linear), { Offset = Vector2.new(1, 0) })
+            t:Play() t.Completed:Wait()
+        end)
+        if not ok or state.unloaded or not grad.Parent then break end
+        grad.Offset = Vector2.new(-1, 0)
+        local ok2 = pcall(function()
+            local t2 = TS:Create(grad, TweenInfo.new(2.5, Enum.EasingStyle.Linear), { Offset = Vector2.new(0, 0) })
+            t2:Play() t2.Completed:Wait()
+        end)
+        if not ok2 then break end
+    end
+end)
+
+-- ============ HEADER ============
+local logo = Instance.new("Frame")
+logo.Position = UDim2.new(0, 14, 0, 16)
+logo.Size = UDim2.new(0, 38, 0, 38)
+logo.BackgroundColor3 = CARD
+logo.BorderSizePixel = 0
+logo.Parent = frame
+local lC = Instance.new("UICorner") lC.CornerRadius = UDim.new(0, 11) lC.Parent = logo
+local lG = Instance.new("UIGradient")
+lG.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 30, 52)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(12, 18, 34)),
+}
+lG.Rotation = 45
+lG.Parent = logo
+local lS = Instance.new("UIStroke") lS.Color = ACCENT lS.Thickness = 1.2 lS.Transparency = 0.25 lS.Parent = logo
+local logoTxt = Instance.new("TextLabel")
+logoTxt.Size = UDim2.new(1, 0, 1, 0)
+logoTxt.BackgroundTransparency = 1
+logoTxt.Text = "B5"
+logoTxt.Font = Enum.Font.GothamBlack
+logoTxt.TextSize = 15
+logoTxt.TextColor3 = ACCENT
+logoTxt.Parent = logo
+
+local title = Instance.new("TextLabel")
+title.Text = "BHRM5 OPERATOR TOOL 2"
+title.Position = UDim2.new(0, 58, 0, 16)
+title.Size = UDim2.new(1, -96, 0, 18)
+title.BackgroundTransparency = 1
+title.TextColor3 = TXT
+title.Font = Enum.Font.GothamBlack
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextTruncate = Enum.TextTruncate.AtEnd
+title.Parent = frame
+
+-- live stats row under title
+local statNpc = Instance.new("TextLabel")
+statNpc.Text = "-- NPC"
+statNpc.Position = UDim2.new(0, 58, 0, 36)
+statNpc.Size = UDim2.new(0, 60, 0, 12)
+statNpc.BackgroundTransparency = 1
+statNpc.TextColor3 = ACCENT
+statNpc.Font = Enum.Font.GothamBold
+statNpc.TextSize = 10
+statNpc.TextXAlignment = Enum.TextXAlignment.Left
+statNpc.Parent = frame
+
+local statFps = Instance.new("TextLabel")
+statFps.Text = "-- FPS"
+statFps.Position = UDim2.new(0, 122, 0, 36)
+statFps.Size = UDim2.new(0, 60, 0, 12)
+statFps.BackgroundTransparency = 1
+statFps.TextColor3 = DIM
+statFps.Font = Enum.Font.GothamBold
+statFps.TextSize = 10
+statFps.TextXAlignment = Enum.TextXAlignment.Left
+statFps.Parent = frame
+
+local minBtn = Instance.new("TextButton")
+minBtn.Text = "–"
+minBtn.Position = UDim2.new(1, -34, 0, 16)
+minBtn.Size = UDim2.new(0, 24, 0, 24)
+minBtn.BackgroundColor3 = CARD
+minBtn.TextColor3 = TXT
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 15
+minBtn.BorderSizePixel = 0
+minBtn.AutoButtonColor = false
+minBtn.Parent = frame
+local mC = Instance.new("UICorner") mC.CornerRadius = UDim.new(1, 0) mC.Parent = minBtn
+track(minBtn.MouseEnter:Connect(function()
+    TS:Create(minBtn, TweenInfo.new(0.12), { BackgroundColor3 = CARD_HI }):Play()
+end))
+track(minBtn.MouseLeave:Connect(function()
+    TS:Create(minBtn, TweenInfo.new(0.12), { BackgroundColor3 = CARD }):Play()
+end))
+
+-- active-features pill
+local pill = Instance.new("Frame")
+pill.Position = UDim2.new(0, 14, 0, 62)
+pill.Size = UDim2.new(1, -28, 0, 22)
+pill.BackgroundColor3 = CARD
+pill.BorderSizePixel = 0
+pill.Parent = frame
+local pC = Instance.new("UICorner") pC.CornerRadius = UDim.new(1, 0) pC.Parent = pill
+local dot = Instance.new("Frame")
+dot.Position = UDim2.new(0, 8, 0.5, -4)
+dot.Size = UDim2.new(0, 8, 0, 8)
+dot.BackgroundColor3 = Color3.fromRGB(60, 70, 95)
+dot.BorderSizePixel = 0
+dot.Parent = pill
+local dC = Instance.new("UICorner") dC.CornerRadius = UDim.new(1, 0) dC.Parent = dot
+local status = Instance.new("TextLabel")
+status.Position = UDim2.new(0, 22, 0, 0)
+status.Size = UDim2.new(1, -28, 1, 0)
+status.BackgroundTransparency = 1
+status.Text = "IDLE"
+status.TextColor3 = DIM
+status.Font = Enum.Font.GothamBold
+status.TextSize = 10
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.Parent = pill
+
+-- toggles container
+local cont = Instance.new("Frame")
+cont.Position = UDim2.new(0, 14, 0, 92)
+cont.Size = UDim2.new(1, -28, 0, 188)
+cont.BackgroundTransparency = 1
+cont.Parent = frame
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 7)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = cont
+
+local ICONS = { Fullbright = "FB", ESP = "ES", ["Silent Aim"] = "SA", Wallbang = "WB" }
+
+local toggles = {}
+local function makeToggle(order, label, desc, defaultOn, callback)
+    local card = Instance.new("TextButton")
+    card.LayoutOrder = order
+    card.Size = UDim2.new(1, 0, 0, 41)
+    card.BackgroundColor3 = CARD
+    card.BorderSizePixel = 0
+    card.AutoButtonColor = false
+    card.Text = ""
+    card.Parent = cont
+    local cC = Instance.new("UICorner") cC.CornerRadius = UDim.new(0, 11) cC.Parent = card
+    local cS = Instance.new("UIStroke") cS.Thickness = 1 cS.Transparency = 0.9 cS.Parent = card
+
+    -- icon chip
+    local chip = Instance.new("Frame")
+    chip.Position = UDim2.new(0, 8, 0.5, -12)
+    chip.Size = UDim2.new(0, 24, 0, 24)
+    chip.BackgroundColor3 = Color3.fromRGB(24, 32, 54)
+    chip.BorderSizePixel = 0
+    chip.Parent = card
+    local chC = Instance.new("UICorner") chC.CornerRadius = UDim.new(0, 7) chC.Parent = chip
+    local chipTxt = Instance.new("TextLabel")
+    chipTxt.Size = UDim2.new(1, 0, 1, 0)
+    chipTxt.BackgroundTransparency = 1
+    chipTxt.Text = ICONS[label] or "••"
+    chipTxt.Font = Enum.Font.GothamBlack
+    chipTxt.TextSize = 9
+    chipTxt.TextColor3 = DIM
+    chipTxt.Parent = chip
+
+    local lb = Instance.new("TextLabel")
+    lb.Position = UDim2.new(0, 38, 0, 0)
+    lb.Size = UDim2.new(1, -92, 1, 0)
+    lb.BackgroundTransparency = 1
+    lb.Text = label
+    lb.Font = Enum.Font.GothamBold
+    lb.TextSize = 12
+    lb.TextColor3 = TXT
+    lb.TextXAlignment = Enum.TextXAlignment.Left
+    lb.TextYAlignment = Enum.TextYAlignment.Center
+    lb.Parent = card
+
+    local sw = Instance.new("Frame")
+    sw.Position = UDim2.new(1, -48, 0.5, -10)
+    sw.Size = UDim2.new(0, 40, 0, 20)
+    sw.BackgroundColor3 = Color3.fromRGB(35, 42, 62)
+    sw.BorderSizePixel = 0
+    sw.Parent = card
+    local sC = Instance.new("UICorner") sC.CornerRadius = UDim.new(1, 0) sC.Parent = sw
+    local knob = Instance.new("Frame")
+    knob.Position = UDim2.new(0, 3, 0.5, -7)
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.BackgroundColor3 = Color3.fromRGB(160, 175, 200)
+    knob.BorderSizePixel = 0
+    knob.Parent = sw
+    local kC = Instance.new("UICorner") kC.CornerRadius = UDim.new(1, 0) kC.Parent = knob
+
+    local on = defaultOn
+    local function paint(animate)
+        local bgC = on and ACCENT or Color3.fromRGB(35, 42, 62)
+        local kbP = on and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+        local kbC = on and Color3.new(1, 1, 1) or Color3.fromRGB(160, 175, 200)
+        local dur = animate and 0.18 or 0
+        TS:Create(sw, TweenInfo.new(math.max(dur, 0.01)), { BackgroundColor3 = bgC }):Play()
+        TS:Create(knob, TweenInfo.new(math.max(dur, 0.01)), { Position = kbP, BackgroundColor3 = kbC }):Play()
+        cS.Color = on and ACCENT or Color3.fromRGB(255, 255, 255)
+        cS.Transparency = on and 0.35 or 0.9
+        chip.BackgroundColor3 = on and ACCENT or Color3.fromRGB(24, 32, 54)
+        chipTxt.TextColor3 = on and Color3.fromRGB(6, 12, 24) or DIM
+        lb.TextColor3 = on and Color3.new(1, 1, 1) or TXT
+        if animate then
+            TS:Create(card, TweenInfo.new(0.07), { Size = UDim2.new(1, -6, 0, 39) }):Play()
+            task.delay(0.08, function()
+                if card.Parent then TS:Create(card, TweenInfo.new(0.1), { Size = UDim2.new(1, 0, 0, 41) }):Play() end
             end)
         end
     end
-    origSizes[model] = nil
-    origTrans[model] = nil
+    paint(false)
+    track(card.MouseButton1Click:Connect(function()
+        on = not on
+        paint(true)
+        callback(on)
+    end))
+    track(card.MouseEnter:Connect(function()
+        if not on then TS:Create(card, TweenInfo.new(0.12), { BackgroundColor3 = CARD_HI }):Play() end
+    end))
+    track(card.MouseLeave:Connect(function()
+        TS:Create(card, TweenInfo.new(0.12), { BackgroundColor3 = CARD }):Play()
+    end))
+    toggles[label] = { set = function(v) on = v paint(true) end }
+    return card
 end
 
-local sg = Instance.new("ScreenGui", plr:WaitForChild("PlayerGui"))
-sg.Name = "BHRM5_GUI"
-sg.ResetOnSpawn = false
+-- footer buttons
+local foot = Instance.new("Frame")
+foot.Position = UDim2.new(0, 14, 0, 288)
+foot.Size = UDim2.new(1, -28, 0, 72)
+foot.BackgroundTransparency = 1
+foot.Parent = frame
 
-local frame = Instance.new("Frame", sg)
-frame.Position = UDim2.new(0, 20, 0, 20)
-frame.Size = UDim2.new(0, 260, 0, 340)
-frame.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
-frame.BackgroundTransparency = 0.15
-frame.BorderSizePixel = 0
-frame.ClipsDescendants = true
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 16)
-
-local shadow = Instance.new("Frame", sg)
-shadow.Position = frame.Position + UDim2.new(0, 8, 0, 8)
-shadow.Size = frame.Size
-shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-shadow.BackgroundTransparency = 0.7
-shadow.BorderSizePixel = 0
-shadow.ZIndex = 0
-Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, 16)
-
-local neonBar = Instance.new("Frame", frame)
-neonBar.Size = UDim2.new(0.7, 0, 0, 3)
-neonBar.Position = UDim2.new(0.15, 0, 0, 0)
-neonBar.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
-neonBar.BorderSizePixel = 0
-Instance.new("UICorner", neonBar).CornerRadius = UDim.new(1, 0)
-local glowTween = TweenService:Create(neonBar, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
-    BackgroundTransparency = 0.2
-})
-glowTween:Play()
-
-local title = Instance.new("TextLabel", frame)
-title.Text = "BHRM5 OPERATOR TOOLS 2"
-title.Size = UDim2.new(1, -20, 0, 48)
-title.Position = UDim2.new(0, 10, 0, 6)
-title.BackgroundTransparency = 1
-title.TextColor3 = Color3.fromRGB(220, 235, 255)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 18
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextYAlignment = Enum.TextYAlignment.Center
-
-local sub = Instance.new("TextLabel", frame)
-sub.Text = "by Ben = Katro"
-sub.Size = UDim2.new(1, -20, 0, 18)
-sub.Position = UDim2.new(0, 10, 0, 50)
-sub.BackgroundTransparency = 1
-sub.TextColor3 = Color3.fromRGB(140, 140, 180)
-sub.Font = Enum.Font.Gotham
-sub.TextSize = 11
-sub.TextXAlignment = Enum.TextXAlignment.Left
-sub.TextYAlignment = Enum.TextYAlignment.Top
-
-status = Instance.new("TextLabel", frame)
-status.Text = "◆ " .. countNPCs() .. " NPCs geladen"
-status.Size = UDim2.new(1, -20, 0, 16)
-status.Position = UDim2.new(0, 10, 0, 70)
-status.BackgroundTransparency = 1
-status.TextColor3 = Color3.fromRGB(100, 200, 100)
-status.Font = Enum.Font.Gotham
-status.TextSize = 11
-status.TextXAlignment = Enum.TextXAlignment.Left
-status.TextYAlignment = Enum.TextYAlignment.Top
-
-local cont = Instance.new("Frame", frame)
-cont.Position = UDim2.new(0, 10, 0, 90)
-cont.Size = UDim2.new(1, -20, 1, -110)
-cont.BackgroundTransparency = 1
-
-local list = Instance.new("UIListLayout", cont)
-list.Padding = UDim.new(0, 7)
-list.FillDirection = Enum.FillDirection.Vertical
-list.HorizontalAlignment = Enum.HorizontalAlignment.Center
-list.VerticalAlignment = Enum.VerticalAlignment.Top
-
-local function makeBtn(text, color, icon)
-    local b = Instance.new("TextButton", cont)
-    b.Size = UDim2.new(1, 0, 0, 34)
-    b.Text = (icon and icon .. " " or "") .. text
-    b.BackgroundColor3 = color
-    b.TextColor3 = Color3.new(1, 1, 1)
+local function footBtn(text, y, accent)
+    local b = Instance.new("TextButton")
+    b.Text = text
+    b.Position = UDim2.new(0, 0, 0, y)
+    b.Size = UDim2.new(1, 0, 0, 20)
+    b.BackgroundColor3 = CARD
+    b.TextColor3 = accent and ACCENT or DIM
     b.Font = Enum.Font.GothamBold
-    b.TextSize = 14
+    b.TextSize = 10
     b.BorderSizePixel = 0
     b.AutoButtonColor = false
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
-    local function onHover()
-        TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.2)}):Play()
-    end
-    local function onLeave()
-        TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = color}):Play()
-    end
-    b.MouseEnter:Connect(onHover)
-    b.MouseLeave:Connect(onLeave)
+    b.Parent = foot
+    local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 7) c.Parent = b
+    local s = Instance.new("UIStroke") s.Transparency = 0.85 s.Parent = b
+    track(b.MouseEnter:Connect(function()
+        TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = CARD_HI }):Play()
+    end))
+    track(b.MouseLeave:Connect(function()
+        TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = CARD }):Play()
+    end))
     return b
 end
+local aimBtn = footBtn("AIM: HEAD", 0, true)
+local rescanBtn = footBtn("RESCAN", 26, false)
+local unloadBtn = footBtn("UNLOAD", 50, false)
+unloadBtn.TextColor3 = Color3.fromRGB(255, 150, 160)
 
-local fbBtn = makeBtn("FullBright", Color3.fromRGB(20, 40, 80), "☀")
-fbBtn.MouseButton1Click:Connect(function()
-    state.fullBright = not state.fullBright
-    if state.fullBright then
-        if fbConn then fbConn:Disconnect() end
+track(aimBtn.MouseButton1Click:Connect(function()
+    state.aimPart = (state.aimPart == "Head") and "Root" or "Head"
+    aimBtn.Text = "AIM: " .. string.upper(state.aimPart)
+    cachedTarget = nil
+end))
+track(rescanBtn.MouseButton1Click:Connect(function()
+    status.Text = "rescanning…"
+    task.spawn(scanNPCs)
+end))
+
+makeToggle(1, "Fullbright", "", false, function(on)
+    state.fullBright = on
+    if on then
+        if fbConn then pcall(function() fbConn:Disconnect() end) end
         fbConn = RunService.RenderStepped:Connect(applyFB)
         applyFB()
-        fbBtn.Text = "☀ FullBright ON"
-        fbBtn.BackgroundColor3 = Color3.fromRGB(20, 80, 40)
     else
-        if fbConn then fbConn:Disconnect() fbConn = nil end
+        if fbConn then pcall(function() fbConn:Disconnect() end) fbConn = nil end
         restoreFB()
-        fbBtn.Text = "☀ FullBright"
-        fbBtn.BackgroundColor3 = Color3.fromRGB(20, 40, 80)
     end
 end)
-
-local wallBtn = makeBtn("Wall ESP", Color3.fromRGB(30, 30, 55), "⬜")
-wallBtn.MouseButton1Click:Connect(function()
-    state.wallEsp = not state.wallEsp
-    if state.wallEsp then
-        wallBtn.Text = "⬜ Wall ESP ON"
-        wallBtn.BackgroundColor3 = Color3.fromRGB(30, 70, 40)
-        refreshBoxes()
-    else
-        wallBtn.Text = "⬜ Wall ESP"
-        wallBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 55)
-        killAllBoxes()
-    end
+makeToggle(2, "ESP", "", false, function(on)
+    state.wallEsp = on
+    if on then refreshBoxes() else killAllBoxes() end
 end)
-
-local hbBtn = makeBtn("Hitbox", Color3.fromRGB(60, 20, 25), "⬡")
-hbBtn.MouseButton1Click:Connect(function()
-    state.hitbox = not state.hitbox
-    if state.hitbox then
-        hbBtn.Text = "⬡ Hitbox ON"
-        hbBtn.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
-        applyHitboxAndESP()
-    else
-        hbBtn.Text = "⬡ Hitbox"
-        hbBtn.BackgroundColor3 = Color3.fromRGB(60, 20, 25)
-        applyHitboxAndESP()
-    end
-end)
-
-local espBtn = makeBtn("NPC ESP", Color3.fromRGB(20, 55, 65), "👤")
-espBtn.MouseButton1Click:Connect(function()
-    state.npcEsp = not state.npcEsp
-    if state.npcEsp then
-        espBtn.Text = "👤 NPC ESP ON"
-        espBtn.BackgroundColor3 = Color3.fromRGB(20, 75, 65)
-        applyHitboxAndESP()
-    else
-        espBtn.Text = "👤 NPC ESP"
-        espBtn.BackgroundColor3 = Color3.fromRGB(20, 55, 65)
-        applyHitboxAndESP()
-    end
-end)
-
-local ulBtn = makeBtn("UNLOAD", Color3.fromRGB(80, 10, 15), "✕")
-ulBtn.TextColor3 = Color3.fromRGB(255, 160, 160)
-ulBtn.MouseButton1Click:Connect(function()
-    state.unloaded = true
-    killAllBoxes()
-    resetAllSizes()
-    if fbConn then fbConn:Disconnect() fbConn = nil end
-    if renderConn then renderConn:Disconnect() renderConn = nil end
-    restoreFB()
-    sg:Destroy()
-end)
-
-local drag, dragInput, dragStart, startPos
-frame.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        drag = true
-        dragStart = input.Position
-        startPos = frame.Position
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then drag = false end
-        end)
-    end
-end)
-frame.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement then dragInput = input end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if input == dragInput and drag then
-        local delta = input.Position - dragStart
-        frame.Position = startPos + UDim2.new(0, delta.X, 0, delta.Y)
-        shadow.Position = frame.Position + UDim2.new(0, 8, 0, 8)
-    end
-end)
-
-local showBtn
-local function makeShowBtn()
-    if showBtn then showBtn:Destroy() end
-    showBtn = Instance.new("ImageButton", sg)
-    showBtn.Size = UDim2.new(0, 50, 0, 50)
-    showBtn.Position = UDim2.new(0, 20, 1, -68)
-    showBtn.BackgroundColor3 = Color3.fromRGB(15, 15, 28)
-    showBtn.BackgroundTransparency = 0.3
-    showBtn.Image = "rbxassetid://7733714924"
-    showBtn.ImageColor3 = Color3.fromRGB(0, 200, 255)
-    showBtn.ImageTransparency = 0.15
-    showBtn.Visible = false
-    Instance.new("UICorner", showBtn).CornerRadius = UDim.new(1, 0)
-    showBtn.MouseButton1Click:Connect(function()
-        state.guiVis = true
-        frame.Visible = true
-        shadow.Visible = true
-        showBtn.Visible = false
-    end)
-end
-makeShowBtn()
-
-UserInputService.InputBegan:Connect(function(input, gp)
-    if gp or state.unloaded then return end
-    if input.KeyCode == Enum.KeyCode.Insert then
-        state.guiVis = not state.guiVis
-        frame.Visible = state.guiVis
-        shadow.Visible = state.guiVis
-        showBtn.Visible = not state.guiVis
-    end
-end)
-
-scanNPCs()
-status.Text = "◆ " .. countNPCs() .. " NPCs geladen"
-renderConn = RunService.RenderStepped:Connect(onRender)
-
-Workspace.DescendantAdded:Connect(function(descendant)
-    if state.unloaded then return end
-    if descendant:IsA("Model") and descendant.Name == "Male" then
-        task.wait(0.2)
-        if isNPC(descendant) then
-            addNPC(descendant)
-            if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
+makeToggle(3, "Silent Aim", "", false, function(on)
+    state.silentAim = on
+    cachedTarget = nil
+    if on then
+        if not hookSilentAim() then
+            status.Text = "equip gun first"
+            state.silentAim = false
+            toggles["Silent Aim"].set(false)
         end
     end
 end)
+makeToggle(4, "Wallbang", "", false, function(on)
+    state.wallbang = on
+    cachedTarget = nil
+end)
 
-task.spawn(function()
-    while not state.unloaded do
-        scanNPCs()
-        if status then status.Text = "◆ " .. countNPCs() .. " NPCs geladen" end
-        task.wait(10)
+local function doUnload()
+    if state.unloaded then return end
+    state.unloaded = true
+    killAllBoxes()
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    table.clear(conns)
+    if fbConn then pcall(function() fbConn:Disconnect() end) fbConn = nil end
+    if renderConn then pcall(function() renderConn:Disconnect() end) renderConn = nil end
+    if addConn then pcall(function() addConn:Disconnect() end) addConn = nil end
+    if inputConn then pcall(function() inputConn:Disconnect() end) inputConn = nil end
+    unhookSilentAim()
+    if fovCircle then pcall(function() fovCircle:Remove() end) fovCircle = nil end
+    restoreFB()
+    pcall(function() sg:Destroy() end)
+end
+track(unloadBtn.MouseButton1Click:Connect(doUnload))
+
+-- drag: press header, move anywhere, release anywhere. never sticks.
+do
+    local dragging = false
+    local dragStart, startPos = nil, nil
+    track(frame.InputBegan:Connect(function(input)
+        if state.unloaded then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            and input.Position.Y - frame.AbsolutePosition.Y < 52 then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement and dragStart then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+            dragStart = nil
+        end
+    end))
+end
+
+-- minimize
+local showBtn = Instance.new("TextButton")
+showBtn.Text = "B5"
+showBtn.Size = UDim2.new(0, 40, 0, 40)
+showBtn.Position = UDim2.new(0, 20, 1, -60)
+showBtn.BackgroundColor3 = BG
+showBtn.TextColor3 = ACCENT
+showBtn.Font = Enum.Font.GothamBlack
+showBtn.TextSize = 14
+showBtn.Visible = false
+showBtn.Parent = sg
+local sbC = Instance.new("UICorner") sbC.CornerRadius = UDim.new(1, 0) sbC.Parent = showBtn
+track(showBtn.MouseButton1Click:Connect(function()
+    state.guiVis = true
+    frame.Visible = true; showBtn.Visible = false
+end))
+track(minBtn.MouseButton1Click:Connect(function()
+    state.guiVis = false
+    frame.Visible = false; showBtn.Visible = true
+end))
+inputConn = track(UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or state.unloaded then return end
+    if input.KeyCode == Enum.KeyCode.Insert then
+        state.guiVis = not state.guiVis
+        frame.Visible = state.guiVis; showBtn.Visible = not state.guiVis
+    end
+end))
+
+-- ============ SILENT AIM (cached @10Hz) ============
+local aimHooked, aimOrigMuzzle, aimMod = false, nil, nil
+cachedTarget = nil
+local cachedTargetPos, cachedWalled, lastTargetPick = nil, false, 0
+local sharedParams = RaycastParams.new()
+sharedParams.FilterType = Enum.RaycastFilterType.Exclude
+sharedParams.IgnoreWater = true
+
+local function pickTarget()
+    if not state.silentAim or state.unloaded then
+        cachedTarget, cachedTargetPos, cachedWalled = nil, nil, false
+        return
+    end
+    local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+    local best, bestPos, bestDist, bestWalled = nil, nil, state.fovRadius, false
+    sharedParams.FilterDescendantsInstances = { plr.Character, cam }
+    for model, d in pairs(npcMap) do
+        local part = (state.aimPart == "Head" and d.head) or d.root
+        if part and part.Parent then
+            local ok, sp, onScreen = pcall(function() return cam:WorldToViewportPoint(part.Position) end)
+            if ok and onScreen then
+                local dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                if dist < bestDist then
+                    local dir = part.Position - cam.CFrame.Position
+                    local res = Workspace:Raycast(cam.CFrame.Position, dir, sharedParams)
+                    local walled = res and res.Instance and not res.Instance:IsDescendantOf(model)
+                    if state.wallbang or not walled then
+                        best, bestPos, bestDist, bestWalled = part, part.Position, dist, walled and true or false
+                    end
+                end
+            end
+        end
+    end
+    cachedTarget, cachedTargetPos, cachedWalled = best, bestPos, bestWalled
+    lastTargetPick = os.clock()
+end
+
+hookSilentAim = function()
+    if aimHooked then return true end
+    local gni = getnilinstances or get_nil_instances
+    if not gni then return false end
+    local mod = nil
+    for _, v in next, gni() do
+        if v.Name == "FirearmInventory" and v:IsA("ModuleScript") then mod = v break end
+    end
+    if not mod then return false end
+    local ok, req = pcall(require, mod)
+    if not ok or not req or not req.GetMuzzleCFrame then return false end
+    aimMod, aimOrigMuzzle = req, req.GetMuzzleCFrame
+    local orig = aimOrigMuzzle
+    req.GetMuzzleCFrame = function(self, ...)
+        local mn = select("#", ...)
+        local okM, mz
+        if mn > 0 then
+            local a = { ... }
+            okM, mz = pcall(function() return orig(self, unpack(a, 1, mn)) end)
+        else
+            okM, mz = pcall(function() return orig(self) end)
+        end
+        if not okM or not mz then
+            if mn > 0 then return orig(self, ...) else return orig(self) end
+        end
+        if os.clock() - lastTargetPick > 0.1 or (cachedTarget and not cachedTarget.Parent) then pickTarget() end
+        if cachedTarget and cachedTarget.Parent then
+            local aimAt = cachedTargetPos
+            if state.aimPart == "Head" then aimAt = aimAt + Vector3.new(0, 0.15, 0) end
+            local origin = mz.Position
+            if state.wallbang and cachedWalled then
+                local toT = aimAt - origin
+                local dist = toT.Magnitude
+                if dist > 4 then
+                    origin = origin + toT.Unit * math.min(15, dist - 1)
+                end
+            end
+            return CFrame.lookAt(origin, aimAt)
+        end
+        return mz
+    end
+    aimHooked = true
+    return true
+end
+unhookSilentAim = function()
+    if aimMod and aimOrigMuzzle then pcall(function() aimMod.GetMuzzleCFrame = aimOrigMuzzle end) end
+    aimHooked, aimOrigMuzzle, aimMod = false, nil, nil
+    cachedTarget, cachedTargetPos, cachedWalled = nil, nil, false
+end
+
+pcall(function()
+    if Drawing and Drawing.new then
+        fovCircle = Drawing.new("Circle")
+        fovCircle.Thickness = 1.5
+        fovCircle.NumSides = 64
+        fovCircle.Filled = false
+        fovCircle.Transparency = 0.9
+        fovCircle.Color = Color3.fromRGB(0, 210, 255)
     end
 end)
 
-print("BHRM5 OPERATOR TOOLS 2 geladen · Insert zum Ein-/Ausblenden")
+-- ============ MAIN LOOP ============
+scanNPCs()
+
+local lastRay, lastStatus, lastCamPos = 0, 0, cam.CFrame.Position
+local fpsAcc, fpsN, fpsShow = 0, 0, 60
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+renderConn = RunService.RenderStepped:Connect(function(dt)
+    if state.unloaded then return end
+    local now = os.clock()
+    fpsAcc += dt; fpsN += 1
+    if fpsAcc >= 0.5 then fpsShow = math.floor(fpsN / fpsAcc + 0.5) fpsAcc, fpsN = 0, 0 end
+    for model, d in pairs(npcMap) do
+        if (not model.Parent) or (d.hum and d.hum.Health <= 0) or (d.root and not d.root.Parent) then
+            removeNPC(model)
+        end
+    end
+    if state.silentAim and now - lastTargetPick > 0.1 then pickTarget() end
+    local camPos = cam.CFrame.Position
+    if state.wallEsp and (now - lastRay > 0.25 or (camPos - lastCamPos).Magnitude > 2) then
+        lastRay = now; lastCamPos = camPos
+        rayParams.FilterDescendantsInstances = { plr.Character, cam }
+        local n = 0
+        for adorned, box in pairs(boxMap) do
+            n += 1
+            if n > 10 then break end
+            if adorned and adorned.Parent and box and box.Parent then
+                local dir = adorned.Position - camPos
+                if dir.Magnitude > 5 then
+                    local ok, result = pcall(function() return Workspace:Raycast(camPos, dir, rayParams) end)
+                    local visible = true
+                    if ok and result and result.Instance then
+                        visible = result.Instance:IsDescendantOf(adorned.Parent)
+                    end
+                    box.Color3 = visible and Color3.fromRGB(40, 255, 130) or Color3.fromRGB(255, 60, 60)
+                end
+            else
+                boxMap[adorned] = nil
+            end
+        end
+    end
+    if now - lastStatus > 0.5 then
+        lastStatus = now
+        local flags = {}
+        if state.fullBright then table.insert(flags, "FB") end
+        if state.wallEsp then table.insert(flags, "ESP") end
+        if state.silentAim then table.insert(flags, "AIM:" .. state.aimPart:sub(1, 1)) end
+        if state.wallbang then table.insert(flags, "WB") end
+        local n = countNPCs()
+        if #flags > 0 then
+            status.Text = table.concat(flags, "  •  ")
+            status.TextColor3 = TXT
+            dot.BackgroundColor3 = Color3.fromRGB(40, 200, 120)
+        else
+            status.Text = "IDLE"
+            status.TextColor3 = DIM
+            dot.BackgroundColor3 = Color3.fromRGB(60, 70, 95)
+        end
+        statNpc.Text = n .. " NPC"
+        statFps.Text = fpsShow .. " FPS"
+        statFps.TextColor3 = fpsShow >= 55 and Color3.fromRGB(40, 200, 120)
+            or (fpsShow >= 30 and Color3.fromRGB(255, 190, 60) or Color3.fromRGB(255, 90, 90))
+    end
+    if fovCircle then
+        local ok = pcall(function()
+            fovCircle.Visible = state.silentAim and state.showFov and not state.unloaded
+            fovCircle.Position = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+            fovCircle.Radius = state.fovRadius
+            fovCircle.Color = state.wallbang and Color3.fromRGB(255, 80, 80) or Color3.fromRGB(0, 210, 255)
+        end)
+        if not ok then fovCircle = nil end
+    end
+end)
+
+addConn = track(Workspace.DescendantAdded:Connect(function(desc)
+    if state.unloaded then return end
+    if desc:IsA("Model") and desc.Name == "Male" then
+        task.delay(0.3, function() tryAddLater(desc, 0) end)
+    end
+end))
+track(plr.CharacterAdded:Connect(function()
+    task.wait(1)
+    if not state.unloaded then scanNPCs() end
+end))
+task.spawn(function()
+    while not state.unloaded do
+        task.wait(15)
+        if not state.unloaded then pcall(scanNPCs) end
+    end
+end)
+
+-- entrance: fade in (aura tween doubles as backdrop fade)
+frame.BackgroundTransparency = 1
+stroke.Transparency = 1
+aura.ImageTransparency = 1
+TS:Create(frame, TweenInfo.new(0.3), { BackgroundTransparency = 0.02 }):Play()
+TS:Create(stroke, TweenInfo.new(0.4), { Transparency = 0.4 }):Play()
+TS:Create(aura, TweenInfo.new(0.5), { ImageTransparency = 0.88 }):Play()
